@@ -1,0 +1,653 @@
+#!/usr/bin/perl -w
+
+#
+#  Nagios plugin for checking IBM / Lenovo IMM2 (Integrated Management Module)
+#  Requires SNMP to be enabled on the IMM2
+#
+
+
+
+
+# CHANGE LOG
+# ----------
+#   2015-05-12  njeffrey	Script created
+#   2016-06-10  njeffrey	Add support for using snmpinfo on AIX instead of snmpget
+#   2016-06-11  njeffrey	snmpinfo on AIX returns some values in hex instead of ASCII - add hex conversion functionality
+#   2016-10-06  njeffrey	Add verify_snmp subroutine
+#   2018-03-23  njeffrey	Bug fix - use eq instead of == when changing variables from numeric to text
+
+
+
+# PREREQUISITES
+# ------------
+#  You will need to enable SNMPv1 on the Integrated Management Module on the IBM/Lenovo server.
+#  To enable SNMP from the web GUI:  IMM Management, Network, SNMP, Enable SNMPv1, community name, Apply
+#  To enable SNMP from the CLI:      snmp -a on -c1 public -c1i1 0.0.0.0
+
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#
+#  This script is executed on the nagios server, and makes SNMP queries to a remote Windows host.
+#
+#  You will need to add a section similar to the following to the commands.cfg file on the nagios server.  
+#      # 'check_ibm_imm2' command definition
+#      define command{
+#             command_name    check_ibm_imm2
+#             command_line    $USER1$/check_ibm_imm2 -H $HOSTADDRESS$ -c $ARG1$ 
+#             }
+#
+#
+#  You will need to add a section similar to the following to the services.cfg file on the nagios server.  
+#      # Check IBM IMM2
+#      # Requires SNMP enabled on IMM2
+#      # syntax is check_ibm_imm2_snmp!optional_snmp_community
+#      define service {
+#              use                             generic-24x7-service
+#              hostgroup_name                  all_imm
+#              service_description             IBM IMM2
+#              check_command                   check_ibm_imm2!optional_snmp_community
+#              }
+
+
+# TROUBLESHOOTING
+# ---------------
+#
+# Please note that the /usr/bin/snmpwalk binary will accept OID values in either of the following formats:
+#    1.3.6.1.2.1.25.4.2.1.2		
+#   .1.3.6.1.2.1.25.4.2.1.2		(note the leading . character)
+# However, the /usr/sbin/snmpinfo binary from AIX does not like the leading dot in the OID,
+# so be sure you specify the OID variable without the leading dot.
+
+
+
+# IMM-MIB
+# ------------------
+#   This script queries the following sections of the IMM MIB
+#   .iso.org.dod.internet.private.enterprise.ibm.ibmAgents.netfinitySupportProcessorAgent.ibmIntegratedManagementModuleMIB.monitors
+#   .1  .3  .6  .1       .4      .1         .2  .3        .51                            .3                               .1
+#
+#      .1.3.6.1.4.1.2.3.51.3.1.1                temperature
+#      .1.3.6.1.4.1.2.3.51.3.1.3 		fans
+#      .1.3.6.1.4.1.2.3.51.3.1.4 		systemHealth
+#      .1.3.6.1.4.1.2.3.51.3.1.5.2 		machineVpd
+#      .1.3.6.1.4.1.2.3.51.3.3.4.2.2   		dnsEnabled
+#      .1.3.6.1.4.1.2.3.51.3.3.4.2.3   		smtpEnabled
+#      .1.3.6.1.4.1.2.3.51.3.5.1.1.0   		systemPower
+#      .1.3.6.1.4.1.2.3.51.3.1.5.21.1.7 	memoryVpdSize
+#      .1.3.6.1.4.1.2.3.51.3.1.5.20.1.1         cpuIndex
+#      .1.3.6.1.4.1.2.3.51.3.1.5.20.1.3 	cpuVpdSpeed
+#      .1.3.6.1.4.1.2.3.51.3.1.5.20.1.7 	cpuVpdCores
+#      .1.3.6.1.4.1.2.3.51.3.1.5.20.1.8 	cpuVpdThreads
+
+
+
+
+ 
+use diagnostics;                                #tell the perl interpreter to give us verbose messages while debugging
+use strict;                                     #enforce good coding practices
+use Getopt::Long;				# require perl module.  Should be in base  perl install.  Or install with:  perl -MCPAN -e 'install Getopt::Long'
+
+
+
+
+# define variables
+my ($snmpwalk,$snmpget,$community,$host,$oid,$output_message);
+my ($opt_h,$opt_H,$opt_c,$opt_v);
+my ($verbose,$cmd);
+my ($temperature_ambient,$system_health,$power_status);
+my ($model_base,$model_subtype,$model_serial,$model_desc,$model_uuid);
+my ($memory_size_gb,$cpu_sockets,$cpu_cores,$cpu_threads,$cpu_speed);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);				#define variables
+$verbose             = "no";						#yes/no flag for verbose output for debugging
+$snmpwalk            = "/usr/bin/snmpwalk";				#location of binary
+$snmpget             = "/usr/bin/snmpget";				#location of binary
+$community           = "public";					#SNMP community string 
+$temperature_ambient = "unknown";					#initialize variable
+$system_health       = "unknown";					#initialize variable
+$power_status        = "unknown";					#initialize variable
+$model_base          = "unknown"; 					#initialize variable
+$model_subtype       = "unknown"; 					#initialize variable
+$model_serial        = "unknown"; 					#initialize variable
+$model_desc          = "unknown"; 					#initialize variable
+$model_uuid          = "unknown"; 					#initialize variable
+$memory_size_gb      = 0; 						#initialize variable
+$cpu_sockets         = 0; 						#initialize variable
+$cpu_cores           = 0; 						#initialize variable
+$cpu_threads         = 0; 						#initialize variable
+$cpu_speed           = 0; 						#initialize variable
+$CHECK_NAME          = "IBM IMM2";					#define name of nagios check
+#
+# Nagios return codes
+#
+$OK=            0;                              			#this script returns a value to nagios for processing
+$WARN=          1;                              			#this script returns a value to nagios for processing
+$CRITICAL=      2;                              			#this script returns a value to nagios for processing
+$UNKNOWN=       3;                              			#this script returns a value to nagios for processing
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
+      "c=s" => \$opt_c, "community=s" => \$opt_c, 
+      "H=s" => \$opt_H, "host=s"      => \$opt_H, 
+   );
+   #
+   # If the user provided -h or --help value, print the help.
+   #
+   if( defined( $opt_h ) ) {
+      print "Use this syntax: $0 -H hostname -c snmp_community_name \n";
+      exit $UNKNOWN;				#exit script
+   }
+   #
+   # If the user supplied -v or --verbose switch, increase script output verbosity for debugging
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   }
+   #
+   # If the user did not supply a -c or --community= value, use the default.
+   #
+   if( defined( $opt_c ) ) {
+      $community = $opt_c;
+   } else {
+      $community = "public";
+   }
+   #
+   # If the user did not supply a -H or --host== value, generate a warning.
+   #
+   if( defined( $opt_H ) ) {
+      $host = $opt_H;
+   } else {
+      print "$CHECK_NAME Unknown - cannot determine remote host \n";
+      exit $UNKNOWN;				#exit script
+   }						#end of if/else block
+}  			                     	#end of subroutine
+
+
+
+
+
+
+sub sanity_checks {
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # figure out where the snmpget command is on this system (varies across UNIX flavors)
+   $snmpget = "/usr/sbin/snmpinfo"      if ( -e "/usr/sbin/snmpinfo" );		#location on AIX
+   $snmpget = "/usr/bin/snmpget"        if ( -e "/usr/bin/snmpget" );		#location on Linux
+   $snmpget = "/usr/local/bin/snmpget"  if ( -e "/usr/local/bin/snmpget" );
+   if( ! defined( $snmpget) ) {
+      print "$CHECK_NAME Unknown - cannot locate snmpget binary\n";
+      exit $UNKNOWN;								#exit script
+   }										#end of if block
+   if( ! -x  $snmpget ) {
+      print "$CHECK_NAME Unknown - $snmpget is not executable\n";
+      exit $UNKNOWN;								#exit script
+   }										#end of if block
+   #
+   # Confirm /etc/mib.defs is readable on AIX
+   if ( -f "/etc/mib.defs" ) {							#check to see if file exists
+      if ( ! -r "/etc/mib.defs" ) {						#check to see if file is readable
+         print "$CHECK_NAME Unknown - /etc/mib.defs is not readable by the current user \n";
+         exit $UNKNOWN;								#exit script
+      } 									#end of if block
+   } 										#end of if block
+}		 								#end of subroutine
+
+
+
+
+
+sub verify_snmp {
+   #
+   print "running verify_snmp subroutine \n" if ($verbose eq "yes");
+   #
+   # Since all the following subroutines depend on SNMP connectivity, 
+   # verify that the remote host responds to SNMP queries.
+   #
+   # Expect output similar to the following if using snmpget
+   # .1.3.6.1.4.1.2.3.51.3.1.1.2.1.3.1 19
+   #  
+   # Expect output similar to the following if using snmpinfo
+   # .1.3.6.1.4.1.2.3.51.3.1.1.2.1.3.1 = 19
+   #  
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.1.2.1.3.1";
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m get -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if ( /[0-9\.]+ +([a-zA-Z0-9:_]+)/) {			#parse out the line of output into OID and value
+         $temperature_ambient = $1;				#assign more meaningful variable name
+         print "   found ambient temperature $temperature_ambient celsius  \n" if ($verbose eq "yes");
+      }								#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+   if ( $temperature_ambient eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - Could not query the IMM via SNMP.  Please verify SNMP community name and confirm SNMP is enabled from the IMM web interface. The IMM sometimes hangs, so you may need to restart the IMM.  Please do not ignore this error.  If you ignore this error, you will be spammed with this alert once every 24 hours, which will only train you to ignore all warnings.  Please investigate and resolve this error. A quick and non-disruptive way to restart the IMM without affecting the attached server is: ssh USERID\@x.x.x.x spreset \n";
+      exit $UNKNOWN;
+   }								#end of if block
+}		 						#end of subroutine
+
+
+
+sub get_temperature {
+   #
+   print "running get_temperature subroutine \n" if ($verbose eq "yes");
+   #
+   # Expect output similar to the following if using snmpget
+   # .1.3.6.1.4.1.2.3.51.3.1.1.2.1.3.1 19
+   #  
+   # Expect output similar to the following if using snmpinfo
+   # .1.3.6.1.4.1.2.3.51.3.1.1.2.1.3.1 = 19
+   #  
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.1.2.1.3.1";
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m get -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if ( /[0-9\.]+ +([a-zA-Z0-9:_]+)/) {			#parse out the line of output into OID and value
+         $temperature_ambient = $1;				#assign more meaningful variable name
+         print "   found ambient temperature $temperature_ambient celsius  \n" if ($verbose eq "yes");
+      }								#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+}		 						#end of subroutine
+
+
+
+
+
+sub get_system_health {
+   #
+   print "running get_system_health subroutine \n" if ($verbose eq "yes");
+   #
+   # Expect output similar to the following
+   # .1.3.6.1.4.1.2.3.51.3.1.4 255
+   #  
+   # Indicates status of system health for the system in which the IMM resides.
+   # 0=nonRecoverable
+   # 2=critical
+   # 4=nonCritical
+   # 255=normal
+   # A value of 'nonRecoverable' indicates a severe error has occurred and the system may not be functioning.
+   # A value of 'critical' indicates that a error has occurred but the system is currently functioning properly.
+   # A value of 'nonCritical' indicates that a condition has occurred that may change the state of the system in the future but currently the system is working properly
+   # A value of 'normal' indicates that the system is operating normally.
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.4.1.0";
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m get -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if ( /[0-9\.]+ +([0-9]+)/) {				#parse out the line of output into OID and value
+         $system_health = $1;					#assign more meaningful variable name
+         $system_health = "nonRecoverable" if ($system_health eq "0");   # use eq instead of == because the value may have been changed from numeric to string
+         $system_health = "critical"       if ($system_health eq "2");   # use eq instead of == because the value may have been changed from numeric to string
+         $system_health = "nonCritical"    if ($system_health eq "4");   # use eq instead of == because the value may have been changed from numeric to string
+         $system_health = "normal"         if ($system_health eq "255"); # use eq instead of == because the value may have been changed from numeric to string
+         print "   found system health status of: $system_health  \n" if ($verbose eq "yes");
+      }								#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+}		 						#end of subroutine
+
+
+
+
+sub get_serial_number {
+   #
+   print "running get_serial_number subroutine \n" if ($verbose eq "yes");
+   #
+   # Expect output similar to the following
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.1.0 "8737"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.2.0 "15X"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.3.0 "21ARDMW"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.4.0 "7096C445CC4B11E3A7AB0090FA6A399C"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.5.0 "IBM Flex System x240"
+   #
+   # WARNING: when using snmpinfo on AIX (instead of snmpget on Linux), 
+   # the results may be returned in hexadecimal instead of ASCII.
+   # This may make the results look like the following:
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.1.0 "38:37:33:37"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.2.0 "31:35:58"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.3.0 "32:31:41:52:44:4d:57"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.4.0 "37:30:39:36:43:34:34:35:43:43:34:42:31:31:45:33:41:37:41:42:30:30:39:30:46:41:36:41:33:39:39:43"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.2.1.5.0 "49:42:4d:20:46:6c:65:78:20:53:79:73:74:65:6d:20:78:32:34:30"
+   #
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.5.2.1.1.0";
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m get -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if (/:/) { 						#if result is given in hexadecimal separated by colons
+         s/://g;						#get rid of the colon separators
+         s/([a-fA-F0-9][a-fA-F0-9])/chr(hex($1))/eg;		#convert hex to ascii
+      } 							#end of if block
+      $model_base = $1 if ( /[0-9\.]+ +([0-9]+)/);		#regex if result is in ASCII
+      print "   found model $model_base  \n" if ($verbose eq "yes");
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.5.2.1.2.0";
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m get -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if (/:/) { 						#if result is given in hexadecimal separated by colons
+         s/://g;						#get rid of the colon separators
+         s/([a-fA-F0-9][a-fA-F0-9])/chr(hex($1))/eg;		#convert hex to ascii
+      } 							#end of if block
+      $model_subtype = $1 if ( /[0-9\.]+ +([a-zA-Z0-9]+)/);	#regex if result is given is ASCII
+      print "   found type $model_subtype  \n" if ($verbose eq "yes");
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.5.2.1.3.0";
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m get -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if (/:/) { 						#if result is given in hexadecimal separated by colons
+         s/://g;						#get rid of the colon separators
+         s/([a-fA-F0-9][a-fA-F0-9])/chr(hex($1))/eg;		#convert hex to ascii
+      } 							#end of if block
+      $model_serial = $1 if ( /[0-9\.]+ +([a-zA-Z0-9]+)/);
+      print "   found serial $model_serial  \n" if ($verbose eq "yes");
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.5.2.1.4.0";
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m get -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if (/:/) { 						#if result is given in hexadecimal separated by colons
+         s/://g;						#get rid of the colon separators
+         s/([a-fA-F0-9][a-fA-F0-9])/chr(hex($1))/eg;		#convert hex to ascii
+      } 							#end of if block
+      $model_uuid = $1 if ( /[0-9\.]+ +([a-zA-Z0-9]+)/);
+      print "   found UUID $model_uuid  \n" if ($verbose eq "yes");
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.5.2.1.5.0";
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m get -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if (/:/) { 						#if result is given in hexadecimal separated by colons
+         s/://g;						#get rid of the colon separators
+         s/([a-fA-F0-9][a-fA-F0-9])/chr(hex($1))/eg;		#convert hex to ascii
+      } 							#end of if block
+      $model_desc = $1 if ( /[0-9\.]+ +([a-zA-Z0-9\-_ ]+)/);
+      print "   found description: $model_desc  \n" if ($verbose eq "yes");
+   }								#end of while loop
+   close IN;							#close filehandle
+}		 						#end of subroutine
+
+
+
+
+
+
+sub get_power_status {
+   #
+   print "running get_power_status subroutine \n" if ($verbose eq "yes");
+   #
+   # Expect output similar to the following
+   # 1.3.6.1.4.1.2.3.51.3.5.1.1.0 255
+   #
+   # 0=poweredOff
+   # 1=sleeps3
+   # 255=poweredOn
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.5.1.1.0";
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m get -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if ( /[0-9\.]+ +([0-9]+)/) {				#parse out the line of output into OID and value
+         $power_status = $1;					#assign more meaningful variable name
+         $power_status = "poweredOff" if ($power_status eq "0");   # use eq instead of == because the value may have been changed from numeric to string
+         $power_status = "sleepS3"    if ($power_status eq "1");   # use eq instead of == because the value may have been changed from numeric to string
+         $power_status = "poweredOn"  if ($power_status eq "255"); # use eq instead of == because the value may have been changed from numeric to string
+         print "   found power status: $power_status  \n" if ($verbose eq "yes");
+      }								#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+}		 						#end of subroutine
+
+
+
+
+sub get_memory_size {
+   #
+   print "running get_memory_size subroutine \n" if ($verbose eq "yes");
+   #
+   # Expect output similar to the following
+   # .1.3.6.1.4.1.2.3.51.3.1.5.21.1.7.1 = INTEGER: 16       <----- each of these entries is a single DIMM
+   # .1.3.6.1.4.1.2.3.51.3.1.5.21.1.7.2 = INTEGER: 16
+   # .1.3.6.1.4.1.2.3.51.3.1.5.21.1.7.3 = INTEGER: 16
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.5.21.1.7";
+   $cmd = "$snmpwalk -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m dump   -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if ( /[0-9\.]+ +([0-9]+)/) {				#parse out the line of output into OID and value
+         $memory_size_gb = $memory_size_gb + $1;		#running tally of installed RAM
+         print "   found memory: $memory_size_gb GB  \n" if ($verbose eq "yes");
+      }								#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+}		 						#end of subroutine
+
+
+
+
+
+sub get_processor_info {
+   #
+   print "running get_processor_info subroutine \n" if ($verbose eq "yes");
+   #
+   # Expect output similar to the following
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.1.1 = INTEGER: 1
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.1.2 = INTEGER: 2
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.2.1 = STRING: "CPU 1"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.2.2 = STRING: "CPU 2"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.3.1 = INTEGER: 2400     <--- speed in Mhz
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.3.2 = INTEGER: 2400
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.4.1 = STRING: "E406 0300 FFFB EBBF 0000 0000 "
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.4.2 = STRING: "E406 0300 FFFB EBBF 0000 0000 "
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.5.1 = STRING: "CENTRAL"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.5.2 = STRING: "CENTRAL"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.6.1 = STRING: "Intel Xeon"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.6.2 = STRING: "Intel Xeon"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.7.1 = INTEGER: 10        <--- cores
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.7.2 = INTEGER: 10        <--- cores
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.8.1 = INTEGER: 20        <--- threads
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.8.2 = INTEGER: 20        <--- threads
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.9.1 = INTEGER: 1200
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.9.2 = INTEGER: 1200
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.10.1 = INTEGER: 64
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.10.2 = INTEGER: 64
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.11.1 = STRING: "Normal"
+   # .1.3.6.1.4.1.2.3.51.3.1.5.20.1.11.2 = STRING: "Normal"
+   #
+   #
+   $oid = "1.3.6.1.4.1.2.3.51.3.1.5.20.1";
+   $cmd = "$snmpwalk -Onq -v 1 -c $community $host $oid" if ($snmpget =~ /snmpget/);	#Linux command
+   $cmd = "$snmpget -m dump -c $community -h $host $oid" if ($snmpget =~ /snmpinfo/);	#AIX    command
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");						#open filehandle
+   while (<IN>) {						#read a line from the filehandle
+      s/\"//g;							#get rid of any quotation marks in the output
+      s/=//g;							#get rid of any equal sign in the output
+      if ( /1.3.6.1.4.1.2.3.51.3.1.5.20.1.1.[0-9]+/) {		#find the OID that shows the cpuIndex
+         $cpu_sockets++;					#increment counter
+         print "   found CPU sockets: $cpu_sockets  \n" if ($verbose eq "yes");
+      }								#end of if block
+      if ( /1.3.6.1.4.1.2.3.51.3.1.5.20.1.3.[0-9]+ +([0-9]+)/) { 	#find the OID that shows the cpuSpeed
+         $cpu_speed = $1;					#assign meaningful variable name
+         print "   found speed: $cpu_speed Mhz  \n" if ($verbose eq "yes");
+      }								#end of if block
+      if ( /1.3.6.1.4.1.2.3.51.3.1.5.20.1.7.[0-9]+ +([0-9]+)/) { 	#find the OID that shows the cpu cores
+         $cpu_cores = $cpu_cores + $1;			#add up all the cpu core across all cpu sockets
+         print "   found cores: $cpu_cores  \n" if ($verbose eq "yes");
+      }								#end of if block
+      if ( /1.3.6.1.4.1.2.3.51.3.1.5.20.1.8.[0-9]+ +([0-9]+)/) { 	#find the OID that shows the cpu threads
+         $cpu_threads = $cpu_threads + $1;			#add up all the cpu threads across all cpu cores
+         print "   found threads: $cpu_threads  \n" if ($verbose eq "yes");
+      }								#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+}		 						#end of subroutine
+
+
+
+
+
+sub print_output {
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   # build an output message that contains all the information
+   $output_message = "System_Health:$system_health  Ambient_Temperature:${temperature_ambient}C  Power_Status:$power_status  RAM:${memory_size_gb}GB  CPU_speed:${cpu_speed}Mhz  CPU_sockets:$cpu_sockets  CPU_cores:$cpu_cores  CPU_threads:$cpu_threads   Model:${model_base}-${model_subtype}  Serial:$model_serial UUID:$model_uuid  Description:$model_desc ";
+   #
+   # alert if the ambient temperature is too high
+   #
+   if ( $temperature_ambient eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - Could not get temperature via SNMP at OID $oid.  $output_message \n";
+      exit $UNKNOWN;
+   }								#end of if block
+   if ( $temperature_ambient > 30 ) {
+      print "$CHECK_NAME CRITICAL - ambient temperature is $temperature_ambient degrees celsius.  The air conditioning may have failed.  $output_message \n";
+      exit $CRITICAL;
+   }								#end of if block
+   if ( $temperature_ambient > 25 ) {
+      print "$CHECK_NAME WARN - ambient temperature is $temperature_ambient degrees celsius.  The air conditioning may have failed.  $output_message \n";
+      exit $WARN;
+   }								#end of if block
+   #
+   #
+   #
+   #
+   # Check IMM system health
+   #
+   # confirm we got a value
+   if ( $system_health eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - Could not get system health via SNMP at OID $oid.  Please confirm SNMP is enabled on the IMM2. $output_message \n";
+      exit $UNKNOWN;
+   }								#end of if block
+   if ( $system_health eq "nonRecoverable" ) {
+      print "$CHECK_NAME CRITICAL - system health is $system_health.  Please login to the web interface of the IMM2 to investigate.  $output_message \n";
+      exit $CRITICAL;
+   }								#end of if block
+   if ( $system_health eq "critical" ) {
+      print "$CHECK_NAME CRITICAL - system health is $system_health.  Please login to the web interface of the IMM2 to investigat.  $output_message \n";
+      exit $CRITICAL;
+   }								#end of if block
+   if ( $system_health eq "nonCritical" ) {
+      print "$CHECK_NAME WARN - system health is $system_health.  Please login to the web interface of the IMM2 to investigate.  $output_message \n";
+      exit $WARN;
+   }								#end of if block
+   #
+   #
+   #
+   # Check power status
+   #
+   # confirm we got a value
+   if ( $power_status eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - Could not get power status via SNMP at OID $oid.  Please confirm SNMP is enabled on the IMM2.  $output_message \n";
+      exit $UNKNOWN;
+   }								#end of if block
+   if ( $power_status eq "sleepS3" ) {
+      print "$CHECK_NAME WARN - the power state of the server managed by this IMM2 is $power_status, which is uncommon for a server.  $output_message \n";
+      exit $WARN;
+   }								#end of if block
+   if ( $power_status eq "poweredOff" ) {
+      print "$CHECK_NAME WARN - the power state of the server managed by this IMM2 is $power_status, which is uncommon for a server.  $output_message \n";
+      exit $WARN;
+   }								#end of if block
+   #
+   #
+   #
+   #
+   #
+   # We should only get this far if there were no problems detected
+   #
+   print "$CHECK_NAME OK - $output_message \n";	
+   exit $OK;
+}                                                      			#end of subroutine
+
+
+
+
+
+
+
+
+# --------------- main body of program ------------------------------------
+get_options;
+sanity_checks;
+verify_snmp;
+get_temperature;
+get_system_health;
+get_serial_number;
+get_power_status;
+get_memory_size;
+get_processor_info;
+print_output;
+
+
