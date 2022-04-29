@@ -24,7 +24,7 @@ You will need to add a section similar to the following to the commands.cfg file
 # Requires SNMP enabled on IMM2
 # syntax is check_ibm_imm2_snmp!optional_snmp_community
 define service {
-        use                             generic-24x7-service
+        use                             generic-service
         hostgroup_name                  all_imm
         service_description             IBM IMM2
         check_command                   check_ibm_imm2!optional_snmp_community
