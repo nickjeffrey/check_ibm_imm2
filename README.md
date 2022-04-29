@@ -29,7 +29,8 @@ define service {
         service_description             IBM IMM2
         check_command                   check_ibm_imm2!optional_snmp_community
         }
- 
+```
+
  # Output
  You will see output similar to the following:
  ```
