@@ -16,7 +16,7 @@ You will need to add a section similar to the following to the commands.cfg file
    command_name    check_ibm_imm2
    command_line    $USER1$/check_ibm_imm2 -H $HOSTADDRESS$ -c $ARG1$ 
    }
-
+```
 
  You will need to add a section similar to the following to the services.cfg file on the nagios server.  
 ```
