@@ -15,6 +15,10 @@
 #   2016-06-11  njeffrey	snmpinfo on AIX returns some values in hex instead of ASCII - add hex conversion functionality
 #   2016-10-06  njeffrey	Add verify_snmp subroutine
 #   2018-03-23  njeffrey	Bug fix - use eq instead of == when changing variables from numeric to text
+#   2018-03-23  njeffrey	Bug fix - use eq instead of == when changing variables from numeric to text
+#   2022-06-17  njeffrey	Add check_name_resolution subroutine
+#   2022-06-17  njeffrey	Add ping_remote_host subroutine
+#   2022-06-17  njeffrey	Add print_to_outputfile subroutine
 
 
 
@@ -22,7 +26,7 @@
 # ------------
 #  You will need to enable SNMPv1 on the Integrated Management Module on the IBM/Lenovo server.
 #  To enable SNMP from the web GUI:  IMM Management, Network, SNMP, Enable SNMPv1, community name, Apply
-#  To enable SNMP from the CLI:      snmp -a on -c1 public -c1i1 0.0.0.0
+#  To enable SNMP from the CLI:      snmp -a on -c1 public -c1i1 0.0.0.0 -l "Datacenter Rack 123" -cn helpdesk@example.com
 
 
 
@@ -41,7 +45,7 @@
 #      # 'check_ibm_imm2' command definition
 #      define command{
 #             command_name    check_ibm_imm2
-#             command_line    $USER1$/check_ibm_imm2 -H $HOSTADDRESS$ -c $ARG1$ 
+#             command_line    $USER1$/check_ibm_imm2 -H $HOSTADDRESS$ -C $ARG1$ 
 #             }
 #
 #
@@ -99,14 +103,18 @@ use Getopt::Long;				# require perl module.  Should be in base  perl install.  O
 
 
 # define variables
-my ($snmpwalk,$snmpget,$community,$host,$oid,$output_message);
-my ($opt_h,$opt_H,$opt_c,$opt_v);
+my ($snmpwalk,$snmpget,$community,$host,$oid);
+my ($opt_h,$opt_H,$opt_C,$opt_v);
 my ($verbose,$cmd);
 my ($temperature_ambient,$system_health,$power_status);
 my ($model_base,$model_subtype,$model_serial,$model_desc,$model_uuid);
 my ($memory_size_gb,$cpu_sockets,$cpu_cores,$cpu_threads,$cpu_speed);
+my ($ping,$pingstatus,$nslookup,$nslookup_status,$outputfile,$output_message);
+my ($epoch,$dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
 my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);				#define variables
 $verbose             = "no";						#yes/no flag for verbose output for debugging
+$ping                = "/bin/ping";              			#location of binary
+$nslookup            = "/bin/nslookup";          			#location of binary
 $snmpwalk            = "/usr/bin/snmpwalk";				#location of binary
 $snmpget             = "/usr/bin/snmpget";				#location of binary
 $community           = "public";					#SNMP community string 
@@ -143,14 +151,14 @@ sub get_options {
    GetOptions(
       "h"   => \$opt_h, "help"        => \$opt_h,
       "v"   => \$opt_v, "verbose"     => \$opt_v,
-      "c=s" => \$opt_c, "community=s" => \$opt_c, 
+      "C=s" => \$opt_C, "community=s" => \$opt_C, 
       "H=s" => \$opt_H, "host=s"      => \$opt_H, 
    );
    #
    # If the user provided -h or --help value, print the help.
    #
    if( defined( $opt_h ) ) {
-      print "Use this syntax: $0 -H hostname -c snmp_community_name \n";
+      print "Use this syntax: $0 -H hostname -C snmp_community_name \n";
       exit $UNKNOWN;				#exit script
    }
    #
@@ -161,8 +169,8 @@ sub get_options {
    #
    # If the user did not supply a -c or --community= value, use the default.
    #
-   if( defined( $opt_c ) ) {
-      $community = $opt_c;
+   if( defined( $opt_C ) ) {
+      $community = $opt_C;
    } else {
       $community = "public";
    }
@@ -206,7 +214,181 @@ sub sanity_checks {
          exit $UNKNOWN;								#exit script
       } 									#end of if block
    } 										#end of if block
+   #
+   # confirm the nslookup binary exists
+   #
+   if ( ! -f "$nslookup" ) {
+      print "ERROR: Cannot find $nslookup \n";
+      exit;
+   }
+   if ( ! -x "$nslookup" ) {
+      print "ERROR: $nslookup is not executable by the current user\n";
+      exit;
+   }
+   #
+   # confirm the ping binary exists
+   #
+   $ping = "/bin/ping"     if ( -f "/bin/ping");        			#different UNIX flavours put binary in different places
+   $ping = "/etc/ping"     if ( -f "/etc/ping");        			#different UNIX flavours put binary in different places
+   $ping = "/usr/bin/ping" if ( -f "/usr/bin/ping");   		 		#different UNIX flavours put binary in different places
+   if( ! -f $ping ) {
+      print "$CHECK_NAME Unknown - cannot locate $ping binary\n";
+      exit $UNKNOWN;                            				#exit script
+   }                                            				#end of if block
+   if( ! -x  $ping ) {
+      print "$CHECK_NAME Unknown - $ping is not executable\n";
+      exit $UNKNOWN;                            				#exit script
+   }                                            				#end of if block
 }		 								#end of subroutine
+
+
+
+
+sub check_name_resolution {
+   #
+   print "running check_name_resolution subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm valid name resolution exists for $host
+   #
+   $nslookup_status = "";							#initialize variable to avoid undef errors
+   if( ! open( NSLOOKUP, "$nslookup $host 2>&1|" ) ) {
+      warn "WARNING: nslookup $host failed: $!\n";
+      return 0;
+   }
+   while (<NSLOOKUP>) {                                                         #read a line from STDIN
+      if (/failed/) {                                                           #look for error message from nslookup
+         $nslookup_status = "failed";                                           #set flag value for $nslookup variable
+      }                                                                         #end of if block
+      if (/SERVFAIL/) {                                                         #look for error message from nslookup
+         $nslookup_status = "failed";                                           #set flag value for $nslookup variable
+      }                                                                         #end of if block
+   }                                                                            #end of while loop
+   close NSLOOKUP;                                                              #close filehandle
+   if ( $nslookup_status eq "failed" ) {                                        #check for flag value
+      print "$CHECK_NAME CRITICAL: no name resolution for $host - please add $host to DNS \n";
+      exit $CRITICAL;                                                           #exit script
+   }                                                                            #end of if block
+}
+
+
+
+sub ping_remote_host {
+   #
+   print "running ping_remote_host subroutine \n" if ($verbose eq "yes");
+   #
+   # Confirm the remote host is up
+   #
+   print "   trying to ping $host \n" if ($verbose eq "yes");
+   $cmd = "$ping -c 1 -w 1 $host";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd 2>&1|");                       #send a single ping to the remote host and wait 1 second for a reply
+   while (<IN>) {                                  #read a line from STDIN
+      if ( /1 packets transmitted, 1 received, 0% packet loss/ ) {                  #ping success
+         print "   ping check succeeded \n" if ($verbose eq "yes");
+      }                                         #end of if block
+      if ( /100% packet loss/ ) {                  #check for ping timeouts (indicates host may be down)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- no ping reply from $host \n";
+          print $pingstatus;                        #print error message
+          exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+      if ( /NOT FOUND/ ) {                         #check for invalid hostname (using AIX ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host - please check DNS\n";
+         print $pingstatus;                        #print error message
+         exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+      if ( /Name or service not known/ ) {         #check for invalid hostname (using Linux ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host - please check DNS\n";
+         print $pingstatus;                        #print error message
+         exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+      if ( /unknown host/ ) {                      #check for invalid hostname (using Linux ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host - please check DNS\n";
+         print $pingstatus;                        #print error message
+         exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+      if ( /no route to host/ ) {                  #check for routing problems
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not find a route to $host - check routing tables \n";
+         print $pingstatus;                        #print error message
+         exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+   }                                               #end of while loop
+   close IN;                                       #close filehandle
+}                                                       #end of subroutine
+
+
+
+sub check_for_output_file {
+   #
+   # a cron job may have already created the output file that we need
+   #
+   print "running check_for_output_file subroutine \n" if ($verbose eq "yes");
+   #
+   unless ($host) {
+      print "$CHECK_NAME UNKNOWN - Could not determine hostname or IP address for host $host \n";
+      exit $UNKNOWN;
+   }                                                                            #end of unless block
+   $outputfile = "/tmp/nagios.check_ibm_imm2.$host";                             #name of temporary file
+   print"   checking for existence of temporary file $outputfile \n" if ($verbose eq "yes");
+   #
+   # delete the output file if it is more than 15 minutes old
+   if ( -e "$outputfile" ) {                                                    #see if a cron job has already provided the info we need
+      $epoch = time();                                                          #number of seconds since the epoch
+      ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($outputfile);
+      if ( ($epoch - $mtime) > (60 * 15) ) {                                    #mtime is last file modification time in seconds since the epoch
+         print "   deleting obsolete file $outputfile \n" if ($verbose eq "yes");
+         unlink "$outputfile";                                                  #delete file if it is too old to be of any use
+         # confirm the file was deleted
+         if ( -e "$outputfile" ) {
+            print "$CHECK_NAME UNKNOWN - Could not delete temporary file $outputfile - please check file permissions \n";
+            exit $UNKNOWN;
+         }                                                                      #end of if block
+      }                                                                         #end of if block
+   }                                                                            #end of if block
+   #
+   if ( -e "$outputfile" ) {                                                    #see if a cron job has already provided the info we need
+      print "   found existing file $outputfile - using that for check output \n" if ($verbose eq "yes");
+      open (OUT,"$outputfile") or die "Cannot open $outputfile for reading $! \n";
+      while (<OUT>) {                                                           #read a line from the text file
+         $output_message = $_  if ( $_ =~ /[a-zA-Z]/);                          #get the content of the output file into a variable
+      }                                                                         #end of while loop
+      close OUT;                                                                #close filehandle
+      print $output_message;                                                    #print the content of the output file
+      exit $CRITICAL if ( $output_message =~ /CRITICAL/ );                      #exit script with appropriate return code
+      exit $WARN     if ( $output_message =~ /WARN/ );                          #exit script with appropriate return code
+      exit $UNKNOWN  if ( $output_message =~ /UNKNOWN/ );                       #exit script with appropriate return code
+      exit $OK       if ( $output_message =~ /OK/ );                            #exit script with appropriate return code
+      exit $UNKNOWN;                                                            #only get this far if OK/WARN/CRITICAL/UNKNOWN was not found in the output file
+   }                                                                            #end of if block
+}                                                                               #end of subroutine
+
+
+
+sub print_to_outputfile {
+   #
+   print "running print_to_outputfile \n" if ($verbose eq "yes");
+   #
+   # This subroutine is called whenever an output message is printed, to confirm that the $outputfile exists
+   #
+   # confirm the output message exists
+   unless ($output_message =~ /[a-zA-Z]+/ ) {                                   #check to see if $output_message is empty
+      print "   ERROR - possible script bug, cannot find anything in the \$output_message variable \n" if ($verbose eq "yes");
+      $output_message = "$CHECK_NAME UNKNOWN - could not parse response from storage system \n";
+   }                                                                            #end of unless block
+   print "   Writing this value to outputfile $outputfile : $output_message " if ($verbose eq "yes");
+   #
+   # confirm the $outputfile variable is defined
+   unless ($outputfile) {
+      print "$CHECK_NAME UNKNOWN - the \$outputfile variable is not defined.  This might be a script bug. \n";
+      exit $UNKNOWN;                                                            #only get this far if OK/WARN/CRITICAL/UNKNOWN was not found in the output file
+   }                                                                            #end of unless block
+   #
+   if ( ! -e "$outputfile" ) {                                                  #only run this section if $outputfile does not already exist
+      print "   $outputfile not found - writing output message to $outputfile \n" if ($verbose eq "yes");
+      open (OUT,">$outputfile") or die "Cannot open $outputfile for writing: $! \n";
+      print OUT "$output_message";
+      close OUT;                                                                #close filehandle
+   }                                                                            #end of if block
+}                                                                               #end of subroutine
 
 
 
@@ -241,7 +423,9 @@ sub verify_snmp {
    }								#end of while loop
    close IN;							#close filehandle
    if ( $temperature_ambient eq "unknown" ) {
-      print "$CHECK_NAME UNKNOWN - Could not query the IMM via SNMP.  Please verify SNMP community name and confirm SNMP is enabled from the IMM web interface. The IMM sometimes hangs, so you may need to restart the IMM.  Please do not ignore this error.  If you ignore this error, you will be spammed with this alert once every 24 hours, which will only train you to ignore all warnings.  Please investigate and resolve this error. A quick and non-disruptive way to restart the IMM without affecting the attached server is: ssh USERID\@x.x.x.x spreset \n";
+      $output_message = "$CHECK_NAME UNKNOWN - Could not query the IMM via SNMP.  Please verify SNMP community name and confirm SNMP is enabled from the IMM web interface. The IMM sometimes hangs, so you may need to restart the IMM.  Please do not ignore this error.  If you ignore this error, you will be spammed with this alert once every 24 hours, which will only train you to ignore all warnings.  Please investigate and resolve this error. A quick and non-disruptive way to restart the IMM without affecting the attached server is: ssh USERID\@x.x.x.x spreset \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $UNKNOWN;
    }								#end of if block
 }		 						#end of subroutine
@@ -568,15 +752,21 @@ sub print_output {
    # alert if the ambient temperature is too high
    #
    if ( $temperature_ambient eq "unknown" ) {
-      print "$CHECK_NAME UNKNOWN - Could not get temperature via SNMP at OID $oid.  $output_message \n";
+      $output_message = "$CHECK_NAME UNKNOWN - Could not get temperature via SNMP at OID $oid.  $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $UNKNOWN;
    }								#end of if block
    if ( $temperature_ambient > 30 ) {
-      print "$CHECK_NAME CRITICAL - ambient temperature is $temperature_ambient degrees celsius.  The air conditioning may have failed.  $output_message \n";
+      $output_message = "$CHECK_NAME CRITICAL - ambient temperature is $temperature_ambient degrees celsius.  The air conditioning may have failed.  $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $CRITICAL;
    }								#end of if block
    if ( $temperature_ambient > 25 ) {
-      print "$CHECK_NAME WARN - ambient temperature is $temperature_ambient degrees celsius.  The air conditioning may have failed.  $output_message \n";
+      $output_message = "$CHECK_NAME WARN - ambient temperature is $temperature_ambient degrees celsius.  The air conditioning may have failed.  $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $WARN;
    }								#end of if block
    #
@@ -587,19 +777,27 @@ sub print_output {
    #
    # confirm we got a value
    if ( $system_health eq "unknown" ) {
-      print "$CHECK_NAME UNKNOWN - Could not get system health via SNMP at OID $oid.  Please confirm SNMP is enabled on the IMM2. $output_message \n";
+      $output_message = "$CHECK_NAME UNKNOWN - Could not get system health via SNMP at OID $oid.  Please confirm SNMP is enabled on the IMM2. $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $UNKNOWN;
    }								#end of if block
    if ( $system_health eq "nonRecoverable" ) {
-      print "$CHECK_NAME CRITICAL - system health is $system_health.  Please login to the web interface of the IMM2 to investigate.  $output_message \n";
+      $output_message = "$CHECK_NAME CRITICAL - system health is $system_health.  Please login to the web interface of the IMM2 to investigate.  $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $CRITICAL;
    }								#end of if block
    if ( $system_health eq "critical" ) {
-      print "$CHECK_NAME CRITICAL - system health is $system_health.  Please login to the web interface of the IMM2 to investigat.  $output_message \n";
+      $output_message = "$CHECK_NAME CRITICAL - system health is $system_health.  Please login to the web interface of the IMM2 to investigat.  $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $CRITICAL;
    }								#end of if block
    if ( $system_health eq "nonCritical" ) {
-      print "$CHECK_NAME WARN - system health is $system_health.  Please login to the web interface of the IMM2 to investigate.  $output_message \n";
+      $output_message = "$CHECK_NAME WARN - system health is $system_health.  Please login to the web interface of the IMM2 to investigate.  $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $WARN;
    }								#end of if block
    #
@@ -609,15 +807,21 @@ sub print_output {
    #
    # confirm we got a value
    if ( $power_status eq "unknown" ) {
-      print "$CHECK_NAME UNKNOWN - Could not get power status via SNMP at OID $oid.  Please confirm SNMP is enabled on the IMM2.  $output_message \n";
+      $output_message = "$CHECK_NAME UNKNOWN - Could not get power status via SNMP at OID $oid.  Please confirm SNMP is enabled on the IMM2.  $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $UNKNOWN;
    }								#end of if block
    if ( $power_status eq "sleepS3" ) {
-      print "$CHECK_NAME WARN - the power state of the server managed by this IMM2 is $power_status, which is uncommon for a server.  $output_message \n";
+      $output_message = "$CHECK_NAME WARN - the power state of the server managed by this IMM2 is $power_status, which is uncommon for a server.  $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $WARN;
    }								#end of if block
    if ( $power_status eq "poweredOff" ) {
-      print "$CHECK_NAME WARN - the power state of the server managed by this IMM2 is $power_status, which is uncommon for a server.  $output_message \n";
+      $output_message = "$CHECK_NAME WARN - the power state of the server managed by this IMM2 is $power_status, which is uncommon for a server.  $output_message \n";
+      print "$output_message";     				#print output to screen
+      print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
       exit $WARN;
    }								#end of if block
    #
@@ -627,9 +831,11 @@ sub print_output {
    #
    # We should only get this far if there were no problems detected
    #
-   print "$CHECK_NAME OK - $output_message \n";	
+   $output_message = "$CHECK_NAME OK - $output_message \n";	
+   print "$output_message";     				#print output to screen
+   print_to_outputfile;         				#call subroutine to confirm the output is in the $outputfile used for subsequent script runs
    exit $OK;
-}                                                      			#end of subroutine
+}                                            			#end of subroutine
 
 
 
@@ -641,6 +847,9 @@ sub print_output {
 # --------------- main body of program ------------------------------------
 get_options;
 sanity_checks;
+check_name_resolution;
+ping_remote_host;
+check_for_output_file;
 verify_snmp;
 get_temperature;
 get_system_health;
