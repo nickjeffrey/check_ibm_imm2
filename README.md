@@ -7,7 +7,7 @@ perl, snmp
 # Setup
 You will need to enable SNMPv1 on the Integrated Management Module on the IBM/Lenovo server.
 To enable SNMP from the web GUI:  IMM Management, Network, SNMP, Enable SNMPv1, community name, Apply
-To enable SNMP from the CLI:      snmp -a on -c1 public -c1i1 0.0.0.0
+To enable SNMP from the CLI:      snmp -a on -c1 public -c1i1 0.0.0.0 -l "Datacenter Rack 123" -cn helpdesk@example.com
 
 You will need to add a section similar to the following to the commands.cfg file on the nagios server.  
 ```
